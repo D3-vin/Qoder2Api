@@ -1,0 +1,21 @@
+# Environment variables
+.env
+
+# Runtime state (contains PATs, never commit)
+config.json
+
+# Compiled binary (go build -o qoder2api .)
+qoder2api
+qoder2api.exe
+
+# Cross-platform build artifacts (build.cmd / build.sh)
+build/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Tests must stay next to the code (package internals) but are not published
+*_test.go
+
+build*
+.kiro/
