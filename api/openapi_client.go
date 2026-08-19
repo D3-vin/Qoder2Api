@@ -41,13 +41,13 @@ func NewOpenApiClient() *OpenApiClient {
 // openapiHeaders mirrors v3pro qoder_http.openapi_headers.
 func openapiHeaders(bearer string) map[string]string {
 	h := map[string]string{
-		"accept":           "application/json",
-		"user-agent":       "qoder/1.1.20",
-		"cosy-version":     "1.1.20",
-		"cosy-clienttype":  "5",
-		"cosy-machineos":   "x86_64_win32",
-		"accept-encoding":  "identity",
-		"traceparent":      traceparent(),
+		"accept":          "application/json",
+		"user-agent":      "qoder/1.1.20",
+		"cosy-version":    "1.1.20",
+		"cosy-clienttype": "5",
+		"cosy-machineos":  "x86_64_win32",
+		"accept-encoding": "identity",
+		"traceparent":     traceparent(),
 	}
 	if bearer != "" {
 		h["authorization"] = "Bearer " + bearer

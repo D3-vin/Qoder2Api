@@ -107,7 +107,7 @@ func (p *BridgePool) accountsJSON() []map[string]interface{} {
 				"fetched_at": acc.quotaAt.Format(time.RFC3339),
 				"data":       acc.quotaRaw,
 			},
-			"plan": acc.planRaw,
+			"plan":        acc.planRaw,
 			"free_quotas": acc.freeQuotas,
 		}
 		if !acc.exhaustedUntil.IsZero() && acc.exhaustedUntil.After(now) {

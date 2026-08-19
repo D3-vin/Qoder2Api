@@ -75,7 +75,7 @@ func (c *SignatureApiClient) Heartbeat() (map[string]interface{}, error) {
 		"ide_type":    "qodercli",
 		"ide_version": CosyVersionCLI,
 		// "ide_version": "0.1.43",
-		"extra_info":  map[string]interface{}{},
+		"extra_info": map[string]interface{}{},
 	}
 
 	return c.postEncoded("https://center.qoder.sh/algo/api/v1/heartbeat?Encode=1", hb)

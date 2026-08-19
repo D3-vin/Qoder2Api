@@ -165,18 +165,60 @@ func (c *BearerApiClient) OpenStreamLines(fullUrl string, jsonBody interface{}, 
 		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	return c.execHandler(resp.Body, onLine)
+	return c.execHandler(resp, onLine)
 }
 
-func (c *BearerApiClient) execHandler(body io.Reader, onLine func(string) error) error {
+// streamIdleTimeout bounds how long the SSE stream may stay silent (no bytes)
+// before we give up; long generations are fine, only a silent connection is cut.
+const streamIdleTimeout = 5 * time.Minute
+
+// isStreamDone reports whether an SSE line cleanly terminates the gateway
+// stream: bare or envelope-wrapped [DONE], or the event:finish marker
+// (verified live on api1.qoder.sh, see tools/streamprobe).
+func isStreamDone(line string) bool {
+	if strings.HasPrefix(line, "event:") {
+		return strings.TrimSpace(line[len("event:"):]) == "finish"
+	}
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	payload := strings.TrimSpace(line[5:])
+	if payload == "[DONE]" {
+		return true
+	}
+	var env struct {
+		Body string `json:"body"`
+	}
+	return json.Unmarshal([]byte(payload), &env) == nil && env.Body == "[DONE]"
+}
+
+// isStreamErrorEvent reports the gateway's terminal event:error marker.
+func isStreamErrorEvent(line string) bool {
+	return strings.HasPrefix(line, "event:") && strings.TrimSpace(line[len("event:"):]) == "error"
+}
+
+func (c *BearerApiClient) execHandler(resp *http.Response, onLine func(string) error) error {
+	// Client bodies support SetReadDeadline since Go 1.20 (HTTP/1.1 and HTTP/2).
+	type deadlineSetter interface{ SetReadDeadline(time.Time) error }
+	var deadlineSet func(time.Time) error
+	if ds, ok := resp.Body.(deadlineSetter); ok {
+		deadlineSet = ds.SetReadDeadline
+	}
 	lineBuf := &bytes.Buffer{}
 	buf := make([]byte, 4096)
 	started := time.Now()
 	var totalBytes, lineCount int
+	var sawDone bool
+	var streamErr string
 	firstLogged := false
 
 	for {
-		n, err := body.Read(buf)
+		// ponytail: if the body doesn't support deadlines the call is skipped
+		// and the stream runs without idle protection (same as before).
+		if deadlineSet != nil {
+			_ = deadlineSet(time.Now().Add(streamIdleTimeout))
+		}
+		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			totalBytes += n
 			if !firstLogged {
@@ -206,6 +248,12 @@ func (c *BearerApiClient) execHandler(body io.Reader, onLine func(string) error)
 						}
 						fmt.Printf("[stream] line#%d: %s\n", lineCount, show)
 					}
+					if isStreamErrorEvent(line) {
+						streamErr = "upstream stream failed (event:error)"
+					}
+					if isStreamDone(line) {
+						sawDone = true
+					}
 					if err := onLine(line); err != nil {
 						fmt.Printf("[stream] stopped by handler after %s lines=%d: %v\n",
 							time.Since(started), lineCount, err)
@@ -226,8 +274,14 @@ func (c *BearerApiClient) execHandler(body io.Reader, onLine func(string) error)
 		}
 	}
 
-	fmt.Printf("[stream] read complete after %s bytes=%d lines=%d\n",
-		time.Since(started), totalBytes, lineCount)
+	fmt.Printf("[stream] read complete after %s bytes=%d lines=%d done=%v\n",
+		time.Since(started), totalBytes, lineCount, sawDone)
+	if !sawDone {
+		if streamErr != "" {
+			return fmt.Errorf("%s", streamErr)
+		}
+		return fmt.Errorf("stream ended without [DONE] marker (connection truncated?)")
+	}
 	return nil
 }
 

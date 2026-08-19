@@ -25,12 +25,12 @@ func isLimitAPIError(err error) bool {
 // While buffered, an agent-limit error lets the pool switch PAT and retry
 // without the client seeing anything; after commit writes pass through.
 type failoverWriter struct {
-	target      http.ResponseWriter
-	mode        string // "openai_stream" | "anthropic_stream" | "buffered"
-	buf         bytes.Buffer
-	status      int
-	decided     bool
-	limitReset  time.Time
+	target     http.ResponseWriter
+	mode       string // "openai_stream" | "anthropic_stream" | "buffered"
+	buf        bytes.Buffer
+	status     int
+	decided    bool
+	limitReset time.Time
 }
 
 func newFailoverWriter(w http.ResponseWriter, mode string) *failoverWriter {

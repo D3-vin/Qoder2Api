@@ -2,7 +2,7 @@
 
 OpenAI & Anthropic-compatible gateway for Qoder IDE accounts — single Go binary with an account pool.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -55,6 +55,9 @@ go build -trimpath -ldflags="-s -w" -o qoder2api .
 cp .env.example .env
 # Edit .env — set QODER_PAT from your Qoder account settings (see Configuration)
 ```
+
+> If `.env.example` is missing (bare release binary), just run the binary once —
+> it extracts `.env.example`, `baseprompt_min.json` and `baseprompt.json` automatically.
 
 ### 3. Run
 
@@ -148,9 +151,7 @@ Live model list is served from Qoder at `GET /v1/models`. Built-in aliases:
 ├── auth/                 # Token and signature building
 ├── encoding/             # Qoder wire encoding
 ├── httputil/             # HTTP client helpers
-├── baseprompt_min.json   # Minimal prompt profile (~2 KB)
-├── baseprompt.json       # Full prompt profile (CLI dump)
-├── .env.example          # Configuration template
+├── assets/               # Embedded templates + .env.example (auto-extracted on first run)
 ├── config.json           # Runtime state (managed by dashboard)
 └── README.md
 ```

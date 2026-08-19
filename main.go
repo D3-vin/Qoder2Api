@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"qoder2api/assets"
 	"qoder2api/server"
 
 	"github.com/joho/godotenv"
@@ -51,12 +52,32 @@ func printBanner() {
 	fmt.Println(yellow + "  📧 Telegram:" + reset + " https://t.me/D3_vin")
 	fmt.Println(magenta + "  👤 Author:" + reset + " @D3vin_dev")
 	fmt.Println(green + "  🔗 GitHub:" + reset + " https://github.com/D3-vin/Qoder2Api")
-	fmt.Println(cyan + "  📦 Qoder CLI:" + reset + " 1.0.0")
+	fmt.Println(cyan + "  📦 Qoder CLI:" + reset + " 1.1.0")
 	fmt.Println()
+}
+
+// ensureFiles extracts embedded templates and .env.example on first run,
+// so a bare release binary is usable out of the box.
+func ensureFiles() {
+	for name, data := range map[string][]byte{
+		"baseprompt_min.json": assets.MinTemplate,
+		"baseprompt.json":     assets.FullTemplate,
+		".env.example":        assets.EnvExample,
+	} {
+		if _, err := os.Stat(name); err == nil {
+			continue
+		}
+		if err := os.WriteFile(name, data, 0o644); err != nil {
+			fmt.Printf("[assets] failed to extract %s: %v\n", name, err)
+			continue
+		}
+		fmt.Printf("[assets] extracted %s\n", name)
+	}
 }
 
 func main() {
 	loadEnv()
+	ensureFiles()
 	printBanner()
 
 	cfg := server.LoadConfig()

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"qoder2api/api"
+	"qoder2api/assets"
 	"qoder2api/auth"
 )
 
@@ -95,7 +96,9 @@ type Choice struct {
 type BridgeDelta struct {
 	role      string
 	content   string
+	reasoning string // thinking models stream reasoning_content before content
 	toolCalls []map[string]interface{}
+	finish    string // upstream finish_reason (stop/length/…)
 }
 
 func (d *BridgeDelta) Role() string {
@@ -106,12 +109,20 @@ func (d *BridgeDelta) Content() string {
 	return d.content
 }
 
+func (d *BridgeDelta) Reasoning() string {
+	return d.reasoning
+}
+
 func (d *BridgeDelta) ToolCalls() []map[string]interface{} {
 	return d.toolCalls
 }
 
+func (d *BridgeDelta) FinishReason() string {
+	return d.finish
+}
+
 func (d *BridgeDelta) IsEmpty() bool {
-	return d.role == "" && d.content == "" && len(d.toolCalls) == 0
+	return d.role == "" && d.content == "" && d.reasoning == "" && len(d.toolCalls) == 0
 }
 
 func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
@@ -160,7 +171,7 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 	}
 	fmt.Printf("[bridge] prompt profile=%s\n", profile)
 
-	templateMin, err := os.ReadFile("baseprompt_min.json")
+	templateMin, err := readTemplate("baseprompt_min.json", assets.MinTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +179,8 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 	// Full CLI-dump template is lazy: only required for QODER_PROMPT_PROFILE=full.
 	var templateLite []byte
 	if profile == "full" {
-		if templateLite, err = os.ReadFile("baseprompt.json"); err != nil {
-			return nil, fmt.Errorf("profile=full requires baseprompt.json: %w", err)
+		if templateLite, err = readTemplate("baseprompt.json", assets.FullTemplate); err != nil {
+			return nil, err
 		}
 	}
 
@@ -183,6 +194,18 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 		promptProfile: profile,
 		modelMapping:  modelMapping,
 	}, nil
+}
+
+// readTemplate prefers the file on disk (user-editable, extracted on first
+// run), falling back to the embedded copy shipped inside the binary.
+func readTemplate(name string, embedded []byte) ([]byte, error) {
+	if b, err := os.ReadFile(name); err == nil {
+		return b, nil
+	}
+	if len(embedded) > 0 {
+		return embedded, nil
+	}
+	return nil, fmt.Errorf("template %s missing on disk and not embedded", name)
 }
 
 func (b *OpenAiBridge) selectTemplate(qoderModel string) string {
@@ -238,6 +261,7 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		accumulator := newStreamAccumulator(w, reqId, created, model, up.ToolsEnabled)
+		var usage map[string]interface{}
 
 		err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 			if !strings.HasPrefix(line, "data:") {
@@ -251,6 +275,10 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 				return apiErr
 			}
 			delta := extractDelta(payload)
+			accumulator.noteFinish(delta.FinishReason())
+			if u := extractUsage(payload); u != nil {
+				usage = u
+			}
 			if delta.IsEmpty() {
 				return nil
 			}
@@ -269,9 +297,9 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		accumulator.flush()
 
-		contentN, toolN := accumulator.stats()
-		fmt.Printf("[bridge] stream done content_chunks=%d tool_call_chunks=%d finish=%s\n",
-			contentN, toolN, accumulator.finishReason())
+		contentN, toolN, reasonN := accumulator.stats()
+		fmt.Printf("[bridge] stream done content_chunks=%d tool_call_chunks=%d reasoning_chunks=%d finish=%s\n",
+			contentN, toolN, reasonN, accumulator.finishReason())
 
 		doneChunk := makeChunk(reqId, created, model)
 		choices := doneChunk["choices"].([]map[string]interface{})
@@ -279,10 +307,24 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		choices[0]["delta"] = map[string]interface{}{}
 
 		w.Write([]byte("data: " + toJson(doneChunk) + "\n\n"))
+		if usage != nil {
+			// OpenAI stream_options.include_usage convention: final chunk with empty choices.
+			w.Write([]byte("data: " + toJson(map[string]interface{}{
+				"id":      reqId,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []interface{}{},
+				"usage":   usage,
+			}) + "\n\n"))
+		}
 		w.Write([]byte("data: [DONE]\n\n"))
 	} else {
 		full := &strings.Builder{}
+		reasoning := &strings.Builder{}
 		toolCalls := newToolCallAccumulator()
+		var usage map[string]interface{}
+		var upstreamFinish string
 
 		err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 			if !strings.HasPrefix(line, "data:") {
@@ -294,6 +336,15 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 				return apiErr
 			}
 			delta := extractDelta(payload)
+			if fr := delta.FinishReason(); fr != "" {
+				upstreamFinish = fr
+			}
+			if u := extractUsage(payload); u != nil {
+				usage = u
+			}
+			if r := delta.Reasoning(); r != "" {
+				reasoning.WriteString(r)
+			}
 			if delta.Content() != "" {
 				full.WriteString(delta.Content())
 			}
@@ -322,6 +373,9 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		msg := map[string]interface{}{
 			"role": "assistant",
 		}
+		if reasoning.Len() > 0 {
+			msg["reasoning_content"] = reasoning.String()
+		}
 		if len(fallbackToolCalls) > 0 {
 			msg["content"] = nil
 			msg["tool_calls"] = fallbackToolCalls
@@ -334,9 +388,19 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 			msg["tool_calls"] = toolCalls.snapshot()
 		}
 
-		finishReason := "stop"
+		finishReason := upstreamFinish
+		if finishReason == "" {
+			finishReason = "stop"
+		}
 		if !toolCalls.isEmpty() || len(fallbackToolCalls) > 0 {
 			finishReason = "tool_calls"
+		}
+		if usage == nil {
+			usage = map[string]interface{}{
+				"prompt_tokens":     0,
+				"completion_tokens": 0,
+				"total_tokens":      0,
+			}
 		}
 
 		out := map[string]interface{}{
@@ -351,11 +415,7 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 					"finish_reason": finishReason,
 				},
 			},
-			"usage": map[string]interface{}{
-				"prompt_tokens":     0,
-				"completion_tokens": 0,
-				"total_tokens":      0,
-			},
+			"usage": usage,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1200,6 +1260,24 @@ func writeStreamAPIError(w http.ResponseWriter, apiErr *QoderAPIError) {
 	w.Write([]byte("data: [DONE]\n\n"))
 }
 
+// extractUsage pulls the gateway usage frame (final choices:[] chunk with
+// usage: prompt/completion/reasoning/cached tokens + credits) if present.
+func extractUsage(dataLine string) map[string]interface{} {
+	var wrapper struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(dataLine)), &wrapper); err != nil || wrapper.Body == "" {
+		return nil
+	}
+	var payload struct {
+		Usage map[string]interface{} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(wrapper.Body), &payload); err != nil {
+		return nil
+	}
+	return payload.Usage
+}
+
 func extractDelta(dataLine string) *BridgeDelta {
 	dataLine = strings.TrimSpace(dataLine)
 	var wrapper map[string]interface{}
@@ -1228,12 +1306,18 @@ func extractDelta(dataLine string) *BridgeDelta {
 		if !ok {
 			continue
 		}
+		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+			result.finish = fr
+		}
 		delta, ok := choice["delta"].(map[string]interface{})
 		if !ok {
 			continue
 		}
 		if role, ok := delta["role"].(string); ok && role != "" {
 			result.role = role
+		}
+		if text, ok := delta["reasoning_content"].(string); ok && text != "" {
+			result.reasoning = text
 		}
 		if text, ok := delta["content"].(string); ok && text != "" {
 			result.content = text
@@ -1266,6 +1350,8 @@ type streamAccumulator struct {
 	streamingText    bool
 	contentChunks    int
 	toolCallChunks   int
+	reasoningChunks  int
+	upstreamFinish   string
 }
 
 func newStreamAccumulator(w http.ResponseWriter, reqId string, created int64, model string, toolsEnabled bool) *streamAccumulator {
@@ -1284,10 +1370,14 @@ func (a *streamAccumulator) accept(delta *BridgeDelta) {
 	if role := delta.Role(); role != "" {
 		a.pendingRole = role
 	}
+	if r := delta.Reasoning(); r != "" {
+		a.emit("", r, nil)
+		a.reasoningChunks++
+	}
 	if len(delta.ToolCalls()) > 0 {
 		a.discardBufferedToolCallText()
 		a.toolCalls.append(delta.ToolCalls())
-		a.emit("", withToolCallIndices(delta.ToolCalls()))
+		a.emit("", "", withToolCallIndices(delta.ToolCalls()))
 		a.toolCallChunks++
 		return
 	}
@@ -1296,7 +1386,7 @@ func (a *streamAccumulator) accept(delta *BridgeDelta) {
 	}
 	if !a.toolCallFallback || a.streamingText {
 		a.streamingText = true
-		a.emit(delta.Content(), nil)
+		a.emit(delta.Content(), "", nil)
 		a.contentChunks++
 		return
 	}
@@ -1317,25 +1407,35 @@ func (a *streamAccumulator) flush() {
 	if a.toolCallFallback {
 		if parsed := parseToolCallsText(buffered); parsed != nil {
 			a.toolCalls.append(parsed)
-			a.emit("", withToolCallIndices(parsed))
+			a.emit("", "", withToolCallIndices(parsed))
 			a.toolCallChunks++
 			return
 		}
 	}
 	a.streamingText = true
-	a.emit(buffered, nil)
+	a.emit(buffered, "", nil)
 	a.contentChunks++
 }
 
-func (a *streamAccumulator) finishReason() string {
-	if a.toolCalls.isEmpty() {
-		return "stop"
+// noteFinish records the upstream finish_reason (last one wins).
+func (a *streamAccumulator) noteFinish(reason string) {
+	if reason != "" {
+		a.upstreamFinish = reason
 	}
-	return "tool_calls"
 }
 
-func (a *streamAccumulator) stats() (int, int) {
-	return a.contentChunks, a.toolCallChunks
+func (a *streamAccumulator) finishReason() string {
+	if !a.toolCalls.isEmpty() {
+		return "tool_calls"
+	}
+	if a.upstreamFinish != "" {
+		return a.upstreamFinish
+	}
+	return "stop"
+}
+
+func (a *streamAccumulator) stats() (int, int, int) {
+	return a.contentChunks, a.toolCallChunks, a.reasoningChunks
 }
 
 func (a *streamAccumulator) emitBufferedText() {
@@ -1344,7 +1444,7 @@ func (a *streamAccumulator) emitBufferedText() {
 	}
 	buffered := a.pendingContent.String()
 	a.pendingContent.Reset()
-	a.emit(buffered, nil)
+	a.emit(buffered, "", nil)
 	a.contentChunks++
 }
 
@@ -1358,11 +1458,13 @@ func (a *streamAccumulator) discardBufferedToolCallText() {
 		return
 	}
 	a.streamingText = true
-	a.emit(buffered, nil)
+	a.emit(buffered, "", nil)
 	a.contentChunks++
 }
 
-func (a *streamAccumulator) emit(content string, toolCalls []map[string]interface{}) {
+// emit writes one SSE chunk; reasoning goes to delta.reasoning_content
+// (DeepSeek/OpenRouter thinking-stream convention).
+func (a *streamAccumulator) emit(content, reasoning string, toolCalls []map[string]interface{}) {
 	chunk := makeChunk(a.reqId, a.created, a.model)
 	delta := chunk["choices"].([]map[string]interface{})[0]["delta"].(map[string]interface{})
 	if !a.emittedChunk {
@@ -1371,6 +1473,9 @@ func (a *streamAccumulator) emit(content string, toolCalls []map[string]interfac
 			role = "assistant"
 		}
 		delta["role"] = role
+	}
+	if reasoning != "" {
+		delta["reasoning_content"] = reasoning
 	}
 	if content != "" {
 		delta["content"] = content

@@ -45,7 +45,9 @@ func (b *OpenAiBridge) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 func (b *OpenAiBridge) completeAnthropic(w http.ResponseWriter, up *qoderUpstream, msgID, outModel string) {
 	full := &strings.Builder{}
+	reasoning := &strings.Builder{}
 	toolCalls := newToolCallAccumulator()
+	var upstreamFinish string
 
 	err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
@@ -56,6 +58,12 @@ func (b *OpenAiBridge) completeAnthropic(w http.ResponseWriter, up *qoderUpstrea
 			return apiErr
 		}
 		delta := extractDelta(payload)
+		if fr := delta.FinishReason(); fr != "" {
+			upstreamFinish = fr
+		}
+		if r := delta.Reasoning(); r != "" {
+			reasoning.WriteString(r)
+		}
 		if delta.Content() != "" {
 			full.WriteString(delta.Content())
 		}
@@ -74,7 +82,7 @@ func (b *OpenAiBridge) completeAnthropic(w http.ResponseWriter, up *qoderUpstrea
 	}
 
 	content := []map[string]interface{}{}
-	stop := "end_turn"
+	stop := anthropicStopReason(upstreamFinish)
 	if !toolCalls.isEmpty() {
 		content = append(content, openAIToolsToAnthropic(toolCalls.snapshot())...)
 		stop = "tool_use"
@@ -97,6 +105,12 @@ func (b *OpenAiBridge) completeAnthropic(w http.ResponseWriter, up *qoderUpstrea
 	}
 	if len(content) == 0 {
 		content = []map[string]interface{}{{"type": "text", "text": ""}}
+	}
+	if reasoning.Len() > 0 {
+		content = append([]map[string]interface{}{{
+			"type":     "thinking",
+			"thinking": reasoning.String(),
+		}}, content...)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -142,6 +156,7 @@ func (b *OpenAiBridge) streamAnthropic(w http.ResponseWriter, up *qoderUpstream,
 
 	writer := &anthropicStreamWriter{w: w, flusher: flusher}
 	toolAcc := newToolCallAccumulator()
+	var upstreamFinish string
 
 	err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
@@ -152,6 +167,12 @@ func (b *OpenAiBridge) streamAnthropic(w http.ResponseWriter, up *qoderUpstream,
 			return apiErr
 		}
 		delta := extractDelta(payload)
+		if fr := delta.FinishReason(); fr != "" {
+			upstreamFinish = fr
+		}
+		if r := delta.Reasoning(); r != "" {
+			writer.onThinking(r)
+		}
 		if delta.Content() != "" {
 			writer.onText(delta.Content())
 		}
@@ -192,7 +213,7 @@ func (b *OpenAiBridge) streamAnthropic(w http.ResponseWriter, up *qoderUpstream,
 		}
 	}
 
-	stop := "end_turn"
+	stop := anthropicStopReason(upstreamFinish)
 	if len(tools) > 0 {
 		stop = "tool_use"
 		writer.emitToolUses(tools)
@@ -201,19 +222,66 @@ func (b *OpenAiBridge) streamAnthropic(w http.ResponseWriter, up *qoderUpstream,
 }
 
 type anthropicStreamWriter struct {
-	w            http.ResponseWriter
-	flusher      http.Flusher
-	textStarted  bool
-	textIndex    int
-	nextIndex    int
-	text         string
-	textEmitted  bool
+	w               http.ResponseWriter
+	flusher         http.Flusher
+	textStarted     bool
+	textIndex       int
+	nextIndex       int
+	thinkingStarted bool
+	thinkingIndex   int
+	text            string
+	textEmitted     bool
+}
+
+// onThinking streams a thinking delta as an Anthropic thinking block
+// (opened lazily before any text/tool block, per Claude extended thinking).
+func (a *anthropicStreamWriter) onThinking(chunk string) {
+	if chunk == "" {
+		return
+	}
+	if !a.thinkingStarted {
+		a.thinkingIndex = a.nextIndex
+		a.nextIndex++
+		writeAnthropicSSE(a.w, "content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": a.thinkingIndex,
+			"content_block": map[string]interface{}{
+				"type":     "thinking",
+				"thinking": "",
+			},
+		})
+		a.thinkingStarted = true
+		a.flusher.Flush()
+	}
+	writeAnthropicSSE(a.w, "content_block_delta", map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": a.thinkingIndex,
+		"delta": map[string]interface{}{
+			"type":     "thinking_delta",
+			"thinking": chunk,
+		},
+	})
+	a.flusher.Flush()
+}
+
+// closeThinking closes the open thinking block (no-op when not started).
+func (a *anthropicStreamWriter) closeThinking() {
+	if !a.thinkingStarted {
+		return
+	}
+	writeAnthropicSSE(a.w, "content_block_stop", map[string]interface{}{
+		"type":  "content_block_stop",
+		"index": a.thinkingIndex,
+	})
+	a.flusher.Flush()
+	a.thinkingStarted = false
 }
 
 func (a *anthropicStreamWriter) onText(chunk string) {
 	if chunk == "" {
 		return
 	}
+	a.closeThinking()
 	a.text += chunk
 	if !a.textStarted {
 		a.textIndex = a.nextIndex
@@ -247,6 +315,7 @@ func (a *anthropicStreamWriter) discardTextAsTools() {
 }
 
 func (a *anthropicStreamWriter) emitToolUses(tools []map[string]interface{}) {
+	a.closeThinking()
 	if a.textStarted {
 		writeAnthropicSSE(a.w, "content_block_stop", map[string]interface{}{
 			"type":  "content_block_stop",
@@ -281,6 +350,7 @@ func (a *anthropicStreamWriter) emitToolUses(tools []map[string]interface{}) {
 }
 
 func (a *anthropicStreamWriter) finish(stop string) {
+	a.closeThinking()
 	if a.textStarted {
 		writeAnthropicSSE(a.w, "content_block_stop", map[string]interface{}{
 			"type":  "content_block_stop",
