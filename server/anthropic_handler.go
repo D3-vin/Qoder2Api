@@ -2,9 +2,10 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
+
+	"qoder2api/logx"
 )
 
 func (b *OpenAiBridge) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -21,7 +22,7 @@ func (b *OpenAiBridge) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	chat := anthropicToChatRequest(req)
 	_, chat.Context1M = stripModel1MSuffix(req.Model)
-	fmt.Printf("[anthropic] model=%s msgs=%d tools=%d stream=%v\n",
+	logx.Infof("[anthropic] model=%s msgs=%d tools=%d stream=%v\n",
 		req.Model, len(chat.Messages), len(chat.Tools), req.Stream)
 
 	up, err := b.prepareQoderUpstream(chat)
@@ -49,7 +50,7 @@ func (b *OpenAiBridge) completeAnthropic(w http.ResponseWriter, up *qoderUpstrea
 	toolCalls := newToolCallAccumulator()
 	var upstreamFinish string
 
-	err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
+	err := b.client().OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
 			return nil
 		}
@@ -158,7 +159,7 @@ func (b *OpenAiBridge) streamAnthropic(w http.ResponseWriter, up *qoderUpstream,
 	toolAcc := newToolCallAccumulator()
 	var upstreamFinish string
 
-	err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
+	err := b.client().OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
 			return nil
 		}

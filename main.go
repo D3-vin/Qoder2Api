@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"qoder2api/assets"
+	"qoder2api/logx"
 	"qoder2api/server"
 
 	"github.com/joho/godotenv"
@@ -52,7 +53,7 @@ func printBanner() {
 	fmt.Println(yellow + "  📧 Telegram:" + reset + " https://t.me/D3_vin")
 	fmt.Println(magenta + "  👤 Author:" + reset + " @D3vin_dev")
 	fmt.Println(green + "  🔗 GitHub:" + reset + " https://github.com/D3-vin/Qoder2Api")
-	fmt.Println(cyan + "  📦 Qoder CLI:" + reset + " 1.1.0")
+	fmt.Println(cyan + "  📦 Qoder CLI:" + reset + " 1.2.0")
 	fmt.Println()
 }
 
@@ -68,10 +69,10 @@ func ensureFiles() {
 			continue
 		}
 		if err := os.WriteFile(name, data, 0o644); err != nil {
-			fmt.Printf("[assets] failed to extract %s: %v\n", name, err)
+			logx.Infof("[assets] failed to extract %s: %v\n", name, err)
 			continue
 		}
-		fmt.Printf("[assets] extracted %s\n", name)
+		logx.Infof("[assets] extracted %s\n", name)
 	}
 }
 

@@ -2,7 +2,7 @@
 
 OpenAI & Anthropic-compatible gateway for Qoder IDE accounts — single Go binary with an account pool.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 

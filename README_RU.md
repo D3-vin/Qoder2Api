@@ -2,7 +2,7 @@
 
 OpenAI и Anthropic-совместимый шлюз для аккаунтов Qoder IDE — один Go-бинарник с пулом аккаунтов.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/D3-vin/Qoder2Api/releases)
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 

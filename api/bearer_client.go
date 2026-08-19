@@ -13,11 +13,13 @@ import (
 	"qoder2api/auth"
 	"qoder2api/encoding"
 	"qoder2api/httputil"
+	"qoder2api/logx"
 )
 
 type BearerApiClient struct {
 	sess   *auth.SessionContext
 	client *http.Client
+	label  string // masked PAT for logging
 }
 
 func NewBearerApiClient(sess *auth.SessionContext) *BearerApiClient {
@@ -25,6 +27,11 @@ func NewBearerApiClient(sess *auth.SessionContext) *BearerApiClient {
 		sess:   sess,
 		client: httputil.NewClient(15 * time.Second),
 	}
+}
+
+// SetLabel attaches a masked-PAT label used in stream logs.
+func (c *BearerApiClient) SetLabel(l string) {
+	c.label = l
 }
 
 func (c *BearerApiClient) CallPost(fullUrl string, jsonBody interface{}) (map[string]interface{}, error) {
@@ -53,10 +60,10 @@ func (c *BearerApiClient) ListModels() (map[string]interface{}, error) {
 		result, err := c.CallGet(url)
 		if err != nil {
 			lastErr = err
-			fmt.Printf("[models] %s failed: %v\n", host, err)
+			logx.Infof("[models] %s failed: %v\n", host, err)
 			continue
 		}
-		fmt.Printf("[models] loaded from %s keys=%d\n", host, len(result))
+		logx.Infof("[models] loaded from %s keys=%d\n", host, len(result))
 		return result, nil
 	}
 	if lastErr == nil {
@@ -100,20 +107,20 @@ func (c *BearerApiClient) OpenStreamLines(fullUrl string, jsonBody interface{}, 
 	bearer := auth.ComposeBearer(payloadB64, sig)
 
 	// Debug output for Bearer requests
-	fmt.Printf("[BEARER DEBUG] PathSig: %s\n", pathSig)
-	fmt.Printf("[BEARER DEBUG] Date: %s\n", date)
+	logx.Debugf("[BEARER DEBUG] PathSig: %s\n", pathSig)
+	logx.Debugf("[BEARER DEBUG] Date: %s\n", date)
 
 	cosyKeyPreview := c.sess.CosyKey
 	if len(cosyKeyPreview) > 20 {
 		cosyKeyPreview = cosyKeyPreview[:20]
 	}
-	fmt.Printf("[BEARER DEBUG] CosyKey: %s\n", cosyKeyPreview)
+	logx.Debugf("[BEARER DEBUG] CosyKey: %s\n", cosyKeyPreview)
 
 	payloadB64Preview := payloadB64
 	if len(payloadB64Preview) > 50 {
 		payloadB64Preview = payloadB64Preview[:50]
 	}
-	fmt.Printf("[BEARER DEBUG] PayloadB64: %s\n", payloadB64Preview)
+	logx.Debugf("[BEARER DEBUG] PayloadB64: %s\n", payloadB64Preview)
 
 	payloadB64Short := payloadB64
 	if len(payloadB64Short) > 30 {
@@ -128,15 +135,15 @@ func (c *BearerApiClient) OpenStreamLines(fullUrl string, jsonBody interface{}, 
 		bodyShort = bodyShort[:20]
 	}
 
-	fmt.Printf("[BEARER DEBUG] Signature input: %s\n%s\n%s\n%s\n%s\n", payloadB64Short, cosyKeyShort, date, bodyShort, pathSig)
-	fmt.Printf("[BEARER DEBUG] Signature: %s\n", sig)
+	logx.Debugf("[BEARER DEBUG] Signature input: %s\n%s\n%s\n%s\n%s\n", payloadB64Short, cosyKeyShort, date, bodyShort, pathSig)
+	logx.Debugf("[BEARER DEBUG] Signature: %s\n", sig)
 
 	bearerPreview := bearer
 	if len(bearerPreview) > 50 {
 		bearerPreview = bearerPreview[:50]
 	}
-	fmt.Printf("[BEARER DEBUG] Bearer: %s\n", bearerPreview)
-	fmt.Printf("[BEARER DEBUG] POST %s\n", fullUrl)
+	logx.Debugf("[BEARER DEBUG] Bearer: %s\n", bearerPreview)
+	logx.Debugf("[BEARER DEBUG] POST %s\n", fullUrl)
 
 	req, err := http.NewRequest("POST", fullUrl, bytes.NewBuffer([]byte(body)))
 	if err != nil {
@@ -150,14 +157,14 @@ func (c *BearerApiClient) OpenStreamLines(fullUrl string, jsonBody interface{}, 
 	}
 
 	started := time.Now()
-	resp, err := httputil.NewClient(5 * time.Minute).Do(req)
+	resp, err := httputil.NewClient(0).Do(req) // no total timeout: long generations are idle-bounded instead
 	if err != nil {
-		fmt.Printf("[BEARER DEBUG] Do failed after %s: %v\n", time.Since(started), err)
+		logx.Debugf("[BEARER DEBUG] Do failed after %s: %v\n", time.Since(started), err)
 		return err
 	}
 	defer resp.Body.Close()
-	fmt.Printf("[BEARER DEBUG] response status=%d after %s\n", resp.StatusCode, time.Since(started))
-	fmt.Printf("[BEARER DEBUG] content-type=%s encoding=%s\n",
+	logx.Debugf("[BEARER DEBUG] response status=%d after %s\n", resp.StatusCode, time.Since(started))
+	logx.Debugf("[BEARER DEBUG] content-type=%s encoding=%s\n",
 		resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
 
 	if resp.StatusCode != 200 {
@@ -226,7 +233,7 @@ func (c *BearerApiClient) execHandler(resp *http.Response, onLine func(string) e
 				if len(preview) > 120 {
 					preview = preview[:120]
 				}
-				fmt.Printf("[stream] first chunk %d bytes after %s: %q\n",
+				logx.Debugf("[stream] first chunk %d bytes after %s: %q\n",
 					n, time.Since(started), string(preview))
 				firstLogged = true
 			}
@@ -246,7 +253,7 @@ func (c *BearerApiClient) execHandler(resp *http.Response, onLine func(string) e
 						if len(show) > 160 {
 							show = show[:160] + "..."
 						}
-						fmt.Printf("[stream] line#%d: %s\n", lineCount, show)
+						logx.Debugf("[stream] line#%d: %s\n", lineCount, show)
 					}
 					if isStreamErrorEvent(line) {
 						streamErr = "upstream stream failed (event:error)"
@@ -255,7 +262,7 @@ func (c *BearerApiClient) execHandler(resp *http.Response, onLine func(string) e
 						sawDone = true
 					}
 					if err := onLine(line); err != nil {
-						fmt.Printf("[stream] stopped by handler after %s lines=%d: %v\n",
+						logx.Infof("[stream] stopped by handler after %s lines=%d: %v\n",
 							time.Since(started), lineCount, err)
 						return err
 					}
@@ -268,14 +275,14 @@ func (c *BearerApiClient) execHandler(resp *http.Response, onLine func(string) e
 			if err == io.EOF {
 				break
 			}
-			fmt.Printf("[stream] read error after %s bytes=%d lines=%d: %v\n",
+			logx.Infof("[stream] read error after %s bytes=%d lines=%d: %v\n",
 				time.Since(started), totalBytes, lineCount, err)
 			return err
 		}
 	}
 
-	fmt.Printf("[stream] read complete after %s bytes=%d lines=%d done=%v\n",
-		time.Since(started), totalBytes, lineCount, sawDone)
+	logx.Infof("[stream] read complete after %s bytes=%d lines=%d done=%v pat=%s\n",
+		time.Since(started), totalBytes, lineCount, sawDone, c.label)
 	if !sawDone {
 		if streamErr != "" {
 			return fmt.Errorf("%s", streamErr)
@@ -320,10 +327,10 @@ func (c *BearerApiClient) call(method, fullUrl string, jsonBody interface{}, ext
 	bearer := auth.ComposeBearer(payloadB64, sig)
 
 	// Debug output for call method
-	fmt.Printf("[CALL DEBUG] Method: %s, URL: %s\n", method, fullUrl)
-	fmt.Printf("[CALL DEBUG] PathSig: %s\n", pathSig)
-	fmt.Printf("[CALL DEBUG] Date: %s\n", date)
-	fmt.Printf("[CALL DEBUG] Signature: %s\n", sig)
+	logx.Debugf("[CALL DEBUG] Method: %s, URL: %s\n", method, fullUrl)
+	logx.Debugf("[CALL DEBUG] PathSig: %s\n", pathSig)
+	logx.Debugf("[CALL DEBUG] Date: %s\n", date)
+	logx.Debugf("[CALL DEBUG] Signature: %s\n", sig)
 
 	var bodyReader io.Reader
 	if body != "" {

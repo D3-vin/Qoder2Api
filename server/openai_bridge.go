@@ -14,11 +14,19 @@ import (
 	"qoder2api/api"
 	"qoder2api/assets"
 	"qoder2api/auth"
+	"qoder2api/logx"
 )
 
 type OpenAiBridge struct {
-	sess          *auth.SessionContext
-	bearerClient  *api.BearerApiClient
+	sessMu       sync.RWMutex // guards sess/bearerClient swaps on session refresh
+	sess         *auth.SessionContext
+	bearerClient *api.BearerApiClient
+
+	pat          string
+	machineId    string
+	machineToken string
+	machineType  string
+
 	templateLite  string
 	templateMin   string
 	promptProfile string            // full | min
@@ -141,26 +149,15 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 		return nil, err
 	}
 
-	fmt.Printf("[bridge] session for %s (%s)\n", getString(jt, "name"), getString(jt, "id"))
+	logx.Infof("[bridge] session for %s (%s)\n", getString(jt, "name"), getString(jt, "id"))
 
-	identity := auth.AuthIdentity{
-		Name:               getString(jt, "name"),
-		Aid:                getString(jt, "id"),
-		Uid:                getString(jt, "id"),
-		YxUid:              "",
-		OrganizationId:     "",
-		OrganizationName:   "",
-		UserType:           getStringOrDefault(jt, "userType", "personal_standard"),
-		SecurityOauthToken: getString(jt, "securityOauthToken"),
-		RefreshToken:       getString(jt, "refreshToken"),
-	}
-
-	sess, err := auth.NewSession(identity, mid, mtoken, mtype)
+	sess, err := auth.NewSession(identityFromJobToken(jt), mid, mtoken, mtype)
 	if err != nil {
 		return nil, err
 	}
 
 	bearerClient := api.NewBearerApiClient(sess)
+	bearerClient.SetLabel(maskPAT(pat))
 
 	profile := strings.ToLower(strings.TrimSpace(os.Getenv("QODER_PROMPT_PROFILE")))
 	if profile == "" {
@@ -169,7 +166,7 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 	if profile != "full" && profile != "min" {
 		profile = "min"
 	}
-	fmt.Printf("[bridge] prompt profile=%s\n", profile)
+	logx.Infof("[bridge] prompt profile=%s\n", profile)
 
 	templateMin, err := readTemplate("baseprompt_min.json", assets.MinTemplate)
 	if err != nil {
@@ -189,11 +186,64 @@ func NewOpenAiBridge(pat string) (*OpenAiBridge, error) {
 	return &OpenAiBridge{
 		sess:          sess,
 		bearerClient:  bearerClient,
+		pat:           pat,
+		machineId:     mid,
+		machineToken:  mtoken,
+		machineType:   mtype,
 		templateLite:  string(templateLite),
 		templateMin:   string(templateMin),
 		promptProfile: profile,
 		modelMapping:  modelMapping,
 	}, nil
+}
+
+// client returns the active bearer client under a read lock so a concurrent
+// session refresh can swap it safely.
+func (b *OpenAiBridge) client() *api.BearerApiClient {
+	b.sessMu.RLock()
+	defer b.sessMu.RUnlock()
+	return b.bearerClient
+}
+
+// identityFromJobToken maps a jobToken exchange response to an auth identity.
+func identityFromJobToken(jt map[string]interface{}) auth.AuthIdentity {
+	return auth.AuthIdentity{
+		Name:               getString(jt, "name"),
+		Aid:                getString(jt, "id"),
+		Uid:                getString(jt, "id"),
+		YxUid:              "",
+		OrganizationId:     "",
+		OrganizationName:   "",
+		UserType:           getStringOrDefault(jt, "userType", "personal_standard"),
+		SecurityOauthToken: getString(jt, "securityOauthToken"),
+		RefreshToken:       getString(jt, "refreshToken"),
+	}
+}
+
+// refreshSession rebuilds the COSY session for this bridge's PAT and swaps the
+// bearer client. Returns false if the gateway still rejects the account.
+func (b *OpenAiBridge) refreshSession() bool {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+
+	sig := api.NewSignatureApiClient(b.machineId, b.machineToken, b.machineType)
+	jt, err := sig.ExchangeJobToken(b.pat)
+	if err != nil {
+		logx.Infof("[bridge] refresh exchange failed: %v\n", err)
+		return false
+	}
+
+	sess, err := auth.NewSession(identityFromJobToken(jt), b.machineId, b.machineToken, b.machineType)
+	if err != nil {
+		logx.Infof("[bridge] refresh session failed: %v\n", err)
+		return false
+	}
+
+	b.sess = sess
+	b.bearerClient = api.NewBearerApiClient(sess)
+	b.bearerClient.SetLabel(maskPAT(b.pat))
+	logx.Infof("[bridge] session refreshed for %s (%s)\n", getString(jt, "name"), getString(jt, "id"))
+	return true
 }
 
 // readTemplate prefers the file on disk (user-editable, extracted on first
@@ -263,13 +313,13 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		accumulator := newStreamAccumulator(w, reqId, created, model, up.ToolsEnabled)
 		var usage map[string]interface{}
 
-		err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
+		err := b.client().OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 			if !strings.HasPrefix(line, "data:") {
 				return nil
 			}
 			payload := strings.TrimSpace(line[5:])
 			if apiErr := parseQoderStreamError(payload); apiErr != nil {
-				fmt.Printf("[bridge] qoder error: %v\n", apiErr)
+				logx.Infof("[bridge] qoder error: %v\n", apiErr)
 				writeStreamAPIError(w, apiErr)
 				flusher.Flush()
 				return apiErr
@@ -298,7 +348,7 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		accumulator.flush()
 
 		contentN, toolN, reasonN := accumulator.stats()
-		fmt.Printf("[bridge] stream done content_chunks=%d tool_call_chunks=%d reasoning_chunks=%d finish=%s\n",
+		logx.Infof("[bridge] stream done content_chunks=%d tool_call_chunks=%d reasoning_chunks=%d finish=%s\n",
 			contentN, toolN, reasonN, accumulator.finishReason())
 
 		doneChunk := makeChunk(reqId, created, model)
@@ -326,13 +376,13 @@ func (b *OpenAiBridge) handleChat(w http.ResponseWriter, r *http.Request) {
 		var usage map[string]interface{}
 		var upstreamFinish string
 
-		err := b.bearerClient.OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
+		err := b.client().OpenStreamLines(up.URL, up.Body, up.ExtraHeaders, func(line string) error {
 			if !strings.HasPrefix(line, "data:") {
 				return nil
 			}
 			payload := strings.TrimSpace(line[5:])
 			if apiErr := parseQoderStreamError(payload); apiErr != nil {
-				fmt.Printf("[bridge] qoder error: %v\n", apiErr)
+				logx.Infof("[bridge] qoder error: %v\n", apiErr)
 				return apiErr
 			}
 			delta := extractDelta(payload)
@@ -439,7 +489,7 @@ func (b *OpenAiBridge) BuildModelsResponse() map[string]interface{} {
 	items := modelsFromMapping(b.mappingSnapshot())
 	live := false
 	if raw, err := b.bearerClient.ListModels(); err != nil {
-		fmt.Printf("[bridge] live model/list failed, using static map: %v\n", err)
+		logx.Infof("[bridge] live model/list failed, using static map: %v\n", err)
 	} else {
 		parsed := parseQoderModelList(raw)
 		if len(parsed) > 0 {
@@ -447,9 +497,9 @@ func (b *OpenAiBridge) BuildModelsResponse() map[string]interface{} {
 			merged := mergeMappingWithCatalog(b.mappingSnapshot(), parsed)
 			b.replaceMapping(merged)
 			live = true
-			fmt.Printf("[bridge] live models=%d mapping=%d\n", len(parsed), len(merged))
+			logx.Infof("[bridge] live models=%d mapping=%d\n", len(parsed), len(merged))
 		} else {
-			fmt.Printf("[bridge] model/list returned no parseable models, top keys=%v\n", mapKeys(raw))
+			logx.Infof("[bridge] model/list returned no parseable models, top keys=%v\n", mapKeys(raw))
 		}
 	}
 

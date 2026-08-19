@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"qoder2api/api"
+	"qoder2api/logx"
 )
 
 // limitErrorMarker is the text QoderAPIError.Error() produces for code 115.
@@ -31,6 +32,7 @@ type failoverWriter struct {
 	status     int
 	decided    bool
 	limitReset time.Time
+	retryKind  string // "" | "limit" | "auth" (set by bufferedRetryableError)
 }
 
 func newFailoverWriter(w http.ResponseWriter, mode string) *failoverWriter {
@@ -100,13 +102,20 @@ func (f *failoverWriter) commit() {
 	}
 }
 
-// bufferedLimitError detects an agent-limit response in buffered output.
-func (f *failoverWriter) bufferedLimitError() bool {
+// bufferedRetryableError detects a limit (115) or auth-expired (105) response
+// in buffered output that should trigger a failover to the next PAT.
+func (f *failoverWriter) bufferedRetryableError() bool {
 	if f.status == http.StatusTooManyRequests {
+		f.retryKind = "limit"
 		return true
 	}
 	data := f.buf.String()
 	if strings.Contains(data, limitErrorMarker) {
+		f.retryKind = "limit"
+		return true
+	}
+	if strings.Contains(data, "Login expired") || strings.Contains(data, `"code":"105"`) {
+		f.retryKind = "auth"
 		return true
 	}
 	for _, line := range strings.Split(data, "\n") {
@@ -114,7 +123,16 @@ func (f *failoverWriter) bufferedLimitError() bool {
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		if apiErr := parseQoderStreamError(strings.TrimSpace(line[5:])); apiErr != nil && isLimitAPIError(apiErr) {
+		apiErr := parseQoderStreamError(strings.TrimSpace(line[5:]))
+		if apiErr == nil {
+			continue
+		}
+		if apiErr.Code == "105" {
+			f.retryKind = "auth"
+			return true
+		}
+		if isLimitAPIError(apiErr) {
+			f.retryKind = "limit"
 			f.limitReset = apiErr.ResetAt
 			return true
 		}
@@ -123,12 +141,12 @@ func (f *failoverWriter) bufferedLimitError() bool {
 }
 
 // finalize flushes buffered output after the handler returns.
-// Returns true when the response was an agent-limit error and the caller may retry.
+// Returns true when the response was a retryable error (limit 115 or auth 105).
 func (f *failoverWriter) finalize() bool {
 	if f.decided {
 		return false
 	}
-	if f.bufferedLimitError() {
+	if f.bufferedRetryableError() {
 		return true
 	}
 	f.commit()
@@ -169,7 +187,7 @@ func NewBridgePool(cfg *Config) (*BridgePool, error) {
 	for _, pat := range pats {
 		bridge, err := NewOpenAiBridge(pat)
 		if err != nil {
-			fmt.Printf("[pool] PAT %s init failed: %v\n", maskPAT(pat), err)
+			logx.Infof("[pool] PAT %s init failed: %v\n", maskPAT(pat), err)
 			continue
 		}
 		pool.accounts = append(pool.accounts, &accountEntry{pat: pat, bridge: bridge})
@@ -185,7 +203,7 @@ func NewBridgePool(cfg *Config) (*BridgePool, error) {
 	cfg.Pats = pool.patsLocked()
 	cfg.ActivePAT = pool.accounts[pool.active].pat
 	if err := cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 	go pool.RefreshQuotas()
 	return pool, nil
@@ -215,6 +233,19 @@ func maskPAT(pat string) string {
 	return pat[:6] + "…" + pat[len(pat)-4:]
 }
 
+// setActive makes acc the dashboard-visible active account so an automatic
+// failover is reflected in the UI (manual "Use" also writes this).
+func (p *BridgePool) setActive(acc *accountEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, a := range p.accounts {
+		if a == acc && i != p.active {
+			p.active = i
+			logx.Infof("[pool] active account auto-switched to %s\n", maskPAT(acc.pat))
+		}
+	}
+}
+
 // pick returns the (attempt+1)-th non-exhausted account starting from active.
 func (p *BridgePool) pick(attempt int) *accountEntry {
 	p.mu.Lock()
@@ -242,7 +273,18 @@ func (p *BridgePool) markExhausted(acc *accountEntry, resetAt time.Time) {
 		until = time.Now().Add(10 * time.Minute)
 	}
 	acc.exhaustedUntil = until
-	fmt.Printf("[pool] %s exhausted until %s\n", maskPAT(acc.pat), until.Format(time.RFC3339))
+	logx.Infof("[pool] %s exhausted until %s\n", maskPAT(acc.pat), until.Format(time.RFC3339))
+}
+
+// markAuthExpired disables an account whose COSY session is dead (code 105).
+// Unlike rate-limit (115), a stale session won't auto-recover; a long cooldown
+// avoids retrying a permanently dead token. A new PAT added via dashboard gets
+// a fresh session; restart also rebuilds sessions.
+func (p *BridgePool) markAuthExpired(acc *accountEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	acc.exhaustedUntil = time.Now().Add(24 * time.Hour)
+	logx.Infof("[pool] %s auth expired (code 105) — skipping for 24h\n", maskPAT(acc.pat))
 }
 
 func (p *BridgePool) dispatchChat(w http.ResponseWriter, r *http.Request) {
@@ -273,25 +315,49 @@ func (p *BridgePool) dispatch(w http.ResponseWriter, r *http.Request, anthropic 
 				mode = "anthropic_stream"
 			}
 		}
-		fw := newFailoverWriter(w, mode)
-		r2 := r.Clone(r.Context())
-		r2.Body = io.NopCloser(bytes.NewReader(body))
-		r2.ContentLength = int64(len(body))
 
-		if anthropic {
-			acc.bridge.handleMessages(fw, r2)
-		} else {
-			acc.bridge.handleChat(fw, r2)
+		fw := p.runRequest(acc, w, r, body, mode, anthropic)
+		if !fw.finalize() {
+			p.setActive(acc)
+			return
 		}
 
-		if fw.finalize() {
-			p.markExhausted(acc, fw.limitReset)
-			fmt.Printf("[pool] %s hit agent limit, failing over\n", maskPAT(acc.pat))
+		if fw.retryKind == "auth" {
+			// Session may be stale but the PAT still valid: rebuild the COSY
+			// session and retry on the SAME account before giving up.
+			if acc.bridge.refreshSession() {
+				logx.Infof("[pool] %s session refreshed, retrying\n", maskPAT(acc.pat))
+				if fw2 := p.runRequest(acc, w, r, body, mode, anthropic); !fw2.finalize() {
+					p.setActive(acc)
+					return
+				}
+			}
+			p.markAuthExpired(acc)
+			logx.Infof("[pool] %s auth expired, failing over\n", maskPAT(acc.pat))
 			continue
 		}
-		return
+
+		p.markExhausted(acc, fw.limitReset)
+		logx.Infof("[pool] %s hit agent limit, failing over\n", maskPAT(acc.pat))
+		continue
 	}
 	p.writePoolExhausted(w, anthropic)
+}
+
+// runRequest executes one chat/messages attempt against a single account,
+// returning the buffered writer so the caller can decide to retry or commit.
+func (p *BridgePool) runRequest(acc *accountEntry, w http.ResponseWriter, r *http.Request, body []byte, mode string, anthropic bool) *failoverWriter {
+	fw := newFailoverWriter(w, mode)
+	r2 := r.Clone(r.Context())
+	r2.Body = io.NopCloser(bytes.NewReader(body))
+	r2.ContentLength = int64(len(body))
+
+	if anthropic {
+		acc.bridge.handleMessages(fw, r2)
+	} else {
+		acc.bridge.handleChat(fw, r2)
+	}
+	return fw
 }
 
 func (p *BridgePool) writePoolExhausted(w http.ResponseWriter, anthropic bool) {
@@ -318,21 +384,19 @@ func (p *BridgePool) writePoolExhausted(w http.ResponseWriter, anthropic bool) {
 // injectDefaults fills model/context/thinking from dashboard settings
 // when the client did not specify them explicitly.
 func (p *BridgePool) injectDefaults(body []byte) []byte {
+	p.mu.Lock()
+	dm, settings := p.cfg.DefaultModel, p.cfg.ModelSettings
+	p.mu.Unlock()
+
 	var obj map[string]interface{}
 	if json.Unmarshal(body, &obj) != nil {
 		return body
 	}
-
-	// Read DefaultModel and ModelSettings[model] in one locked section:
-	// SetRuntime writes ModelSettings concurrently with dispatch.
-	p.mu.Lock()
-	if m, _ := obj["model"].(string); strings.TrimSpace(m) == "" && p.cfg.DefaultModel != "" {
-		obj["model"] = p.cfg.DefaultModel
+	if m, _ := obj["model"].(string); strings.TrimSpace(m) == "" && dm != "" {
+		obj["model"] = dm
 	}
 	model, _ := obj["model"].(string)
-	ms := p.cfg.ModelSettings[model]
-	p.mu.Unlock()
-
+	ms := settings[model]
 	if _, ok := obj["context_size"]; !ok && ms.Context != "" {
 		obj["context_size"] = ms.Context
 	}
@@ -387,7 +451,7 @@ func (p *BridgePool) AddPAT(pat string) error {
 	p.accounts = append(p.accounts, &accountEntry{pat: pat, bridge: bridge})
 	p.cfg.Pats = p.patsLocked()
 	if err := p.cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 	return nil
 }
@@ -412,7 +476,7 @@ func (p *BridgePool) RemoveIndex(index int) error {
 	p.cfg.Pats = p.patsLocked()
 	p.cfg.ActivePAT = p.accounts[p.active].pat
 	if err := p.cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 	return nil
 }
@@ -426,7 +490,7 @@ func (p *BridgePool) SelectIndex(index int) error {
 	p.active = index
 	p.cfg.ActivePAT = p.accounts[index].pat
 	if err := p.cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 	return nil
 }
@@ -436,7 +500,7 @@ func (p *BridgePool) SetDefaultModel(model string) {
 	defer p.mu.Unlock()
 	p.cfg.DefaultModel = strings.TrimSpace(model)
 	if err := p.cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 }
 
@@ -456,7 +520,7 @@ func (p *BridgePool) SetRuntime(model, contextSize, thinking string) {
 	ms.Thinking = thinking
 	p.cfg.ModelSettings[model] = ms
 	if err := p.cfg.Save(); err != nil {
-		fmt.Printf("[pool] config save failed: %v\n", err)
+		logx.Infof("[pool] config save failed: %v\n", err)
 	}
 }
 
@@ -472,7 +536,7 @@ func (p *BridgePool) ensureJT(acc *accountEntry) string {
 	}
 	token, err := p.openapi.ExchangePAT(acc.pat)
 	if err != nil {
-		fmt.Printf("[pool] jt exchange failed for %s: %v\n", maskPAT(acc.pat), err)
+		logx.Infof("[pool] jt exchange failed for %s: %v\n", maskPAT(acc.pat), err)
 		return ""
 	}
 	p.mu.Lock()
@@ -489,7 +553,7 @@ func (p *BridgePool) refreshAccountQuota(acc *accountEntry) {
 		if usage, err := p.openapi.QuotaUsage(jt); err == nil {
 			raw, src = usage, "openapi/quota/usage"
 		} else {
-			fmt.Printf("[pool] quota/usage failed for %s: %v\n", maskPAT(acc.pat), err)
+			logx.Infof("[pool] quota/usage failed for %s: %v\n", maskPAT(acc.pat), err)
 		}
 		if plan, err := p.openapi.UserPlan(jt); err == nil {
 			p.mu.Lock()
@@ -512,7 +576,7 @@ func (p *BridgePool) refreshAccountQuota(acc *accountEntry) {
 	if acts, err := acc.bridge.bearerClient.ListActivities(); err == nil {
 		free = parseFreeQuotas(acts)
 	} else {
-		fmt.Printf("[pool] activity failed for %s: %v\n", maskPAT(acc.pat), err)
+		logx.Infof("[pool] activity failed for %s: %v\n", maskPAT(acc.pat), err)
 	}
 
 	p.mu.Lock()

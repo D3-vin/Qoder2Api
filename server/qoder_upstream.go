@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"qoder2api/logx"
 )
 
 type qoderUpstream struct {
@@ -124,7 +126,7 @@ func (b *OpenAiBridge) prepareQoderUpstream(req ChatRequest) (*qoderUpstream, er
 		body["tools"] = []interface{}{}
 	}
 
-	fmt.Printf("[bridge] model=%s max37=%v context1m=%v prompt=%s\n", model, max37, use1M, truncateString(prompt, 80))
+	logx.Infof("[bridge] model=%s max37=%v context1m=%v pat=%s prompt=%s\n", model, max37, use1M, maskPAT(b.pat), truncateString(prompt, 80))
 
 	url := "https://api1.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 	extra := map[string]string{

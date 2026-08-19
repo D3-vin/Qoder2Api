@@ -12,6 +12,7 @@ import (
 	"qoder2api/auth"
 	"qoder2api/encoding"
 	"qoder2api/httputil"
+	"qoder2api/logx"
 )
 
 type SignatureApiClient struct {
@@ -36,6 +37,24 @@ func (c *SignatureApiClient) ExchangeJobToken(personalToken string) (map[string]
 		"securityOauthToken": "",
 		"refreshToken":       "",
 		"needRefresh":        false,
+		"authInfo":           map[string]interface{}{},
+	}
+
+	outer := map[string]interface{}{
+		"payload":       toJson(inner),
+		"encodeVersion": "1",
+	}
+
+	return c.postEncoded("https://center.qoder.sh/algo/api/v3/user/jobToken?Encode=1", outer)
+}
+
+// RefreshJobToken asks the gateway to renew stale securityOauthToken/refreshToken.
+func (c *SignatureApiClient) RefreshJobToken(personalToken, securityOauthToken, refreshToken string) (map[string]interface{}, error) {
+	inner := map[string]interface{}{
+		"personalToken":      personalToken,
+		"securityOauthToken": securityOauthToken,
+		"refreshToken":       refreshToken,
+		"needRefresh":        true,
 		"authInfo":           map[string]interface{}{},
 	}
 
@@ -93,19 +112,19 @@ func (c *SignatureApiClient) postEncoded(url string, obj interface{}) (map[strin
 	body := encoding.Encode(plain)
 
 	// Debug output
-	fmt.Printf("[DEBUG] URL: %s\n", url)
-	fmt.Printf("[DEBUG] Date: %s\n", date)
-	fmt.Printf("[DEBUG] Signature input: %s&%s&%s\n", auth.APPCODE, auth.SECRET, date)
-	fmt.Printf("[DEBUG] Signature: %s\n", sig)
+	logx.Debugf("[DEBUG] URL: %s\n", url)
+	logx.Debugf("[DEBUG] Date: %s\n", date)
+	logx.Debugf("[DEBUG] Signature input: %s&%s&%s\n", auth.APPCODE, auth.SECRET, date)
+	logx.Debugf("[DEBUG] Signature: %s\n", sig)
 
 	bodyPreview := body
 	if len(body) > 100 {
 		bodyPreview = body[:100]
 	}
-	fmt.Printf("[DEBUG] Body (encoded): %s\n", bodyPreview)
-	fmt.Printf("[DEBUG] MachineToken: %s\n", c.machineToken)
-	fmt.Printf("[DEBUG] MachineType: %s\n", c.machineType)
-	fmt.Printf("[DEBUG] MachineId: %s\n", c.machineId)
+	logx.Debugf("[DEBUG] Body (encoded): %s\n", bodyPreview)
+	logx.Debugf("[DEBUG] MachineToken: %s\n", c.machineToken)
+	logx.Debugf("[DEBUG] MachineType: %s\n", c.machineType)
+	logx.Debugf("[DEBUG] MachineId: %s\n", c.machineId)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(body)))
 	if err != nil {
@@ -129,11 +148,11 @@ func (c *SignatureApiClient) postEncoded(url string, obj interface{}) (map[strin
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		fmt.Printf("[DEBUG] Do failed: %v\n", err)
+		logx.Debugf("[DEBUG] Do failed: %v\n", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
-	fmt.Printf("[DEBUG] response status=%d url=%s\n", resp.StatusCode, url)
+	logx.Debugf("[DEBUG] response status=%d url=%s\n", resp.StatusCode, url)
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)

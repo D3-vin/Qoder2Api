@@ -212,7 +212,8 @@ function quotaParts(acc) {
   var data = (acc.quota || {}).data || {};
   var uq = data.userQuota || null;
   if (uq && (uq.total != null || uq.remaining != null)) {
-    return { remaining: uq.remaining, total: uq.total, expires: data.expiresAt };
+    var used = (uq.used != null) ? uq.used : ((uq.total || 0) - (uq.remaining || 0));
+    return { used: used, total: uq.total, expires: data.expiresAt };
   }
   return null;
 }
@@ -224,7 +225,7 @@ function renderUsage() {
   var plan = acc.plan || {};
   document.getElementById('planVal').textContent = plan.plan_tier_name || plan.user_type || '—';
   var q = quotaParts(acc);
-  document.getElementById('creditsVal').textContent = q ? (q.remaining + ' / ' + q.total + ' left') : ((acc.quota && acc.quota.source) || 'not fetched');
+  document.getElementById('creditsVal').textContent = q ? (q.used + '/' + q.total) : ((acc.quota && acc.quota.source) || 'not fetched');
   document.getElementById('expiresVal').textContent = q ? fmtDate(q.expires) : '—';
 }
 
@@ -270,7 +271,7 @@ async function refreshAccounts() {
     var badges = acc.active ? '<span class="badge badge-green">active</span>' : '<span class="badge badge-gray">standby</span>';
     if (acc.exhausted_until) badges += ' <span class="badge badge-red">limit until ' + acc.exhausted_until.slice(11,16) + '</span>';
     var q = quotaParts(acc);
-    var quotaLine = q ? ('quota: ' + q.remaining + ' / ' + q.total + ' left') : ('quota: ' + (((acc.quota || {}).source) || 'not fetched'));
+    var quotaLine = q ? ('quota: ' + q.used + '/' + q.total) : ('quota: ' + (((acc.quota || {}).source) || 'not fetched'));
     var freeLines = freeQuotaLines(acc);
     div.innerHTML = '<div class="top"><div><b>' + acc.pat + '</b> <span class="muted">' + (acc.user || '') + '</span></div>' +
       '<div class="actions">' + badges +
